@@ -24,7 +24,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    dataset_path = os.path.join(original_repo_path, "preparing_dataset", "mgmno_100.pickle")
+    dataset_path = "datasets/mgmno_100.pickle"
     with open(dataset_path, 'rb') as f:
         raw_data = pickle.load(f)
         

@@ -208,7 +208,7 @@ def train(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset_path", type=str, default=r"c:\Users\Jeremy\Documents\Projects\qgan\Composition-Conditioned-Crystal-GAN\Composition_Conditioned_Crystal_GAN\preparing_dataset\mgmno_100.pickle")
+    parser.add_argument("--dataset_path", type=str, default=r"datasets\mgmno_100.pickle")
     parser.add_argument("--n_epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--z_dim", type=int, default=16)
