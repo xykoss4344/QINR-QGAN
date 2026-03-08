@@ -18,7 +18,7 @@ from skimage.metrics import structural_similarity, peak_signal_noise_ratio
 
 def train(classes_str, dataset_str, patches, layers, n_data_qubits, batch_size, out_folder, checkpoint, randn, patch_shape, qcritic):
     classes = list(set([int(digit) for digit in classes_str]))
-    device = torch.device("cuda:1")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     n_epochs = 20
     image_size = 28  # 28
     channels = 1
@@ -45,7 +45,7 @@ def train(classes_str, dataset_str, patches, layers, n_data_qubits, batch_size, 
     else:
         lr_D = 0.00012#0.0002
     lr_G = 0.00001#0.01
-    b1 = 0
+    b1 = 0.0
     b2 = 0.9
     latent_dim = qubits
     lambda_gp = 10
@@ -70,7 +70,7 @@ def train(classes_str, dataset_str, patches, layers, n_data_qubits, batch_size, 
         gan = PQWGAN_QC(image_size=image_size, channels=channels, n_generators=patches, n_gen_qubits=qubits,n_ancillas=ancillas, n_gen_layers=layers, patch_shape=patch_shape, n_critic_qubits=10, n_critic_layers=175)
     else:
         # gan = PQWGAN_CC(image_size=image_size, channels=channels, n_generators=patches, n_qubits=qubits, n_ancillas=ancillas, n_layers=layers, patch_shape=patch_shape)
-        gan = PQWGAN_CC(image_size=28, channels=1, in_features=args.in_features, out_features=1, hidden_features=args.hidden_features, hidden_layers=args.hidden_layers, spectrum_layer=args.spectrum_layer, use_noise=args.use_noise)
+        gan = PQWGAN_CC(image_size=28, channels=1, in_features=qubits, out_features=1, hidden_features=args.hidden_features, hidden_layers=args.hidden_layers, spectrum_layer=args.spectrum_layer, use_noise=args.use_noise)
 
     critic = gan.critic.to(device)
     generator = gan.generator.to(device)
@@ -96,7 +96,7 @@ def train(classes_str, dataset_str, patches, layers, n_data_qubits, batch_size, 
         batches_done = checkpoint
     counter = 0
     train_data = []
-    classes = int(np.array(classes))
+    classes = int(classes[0])
     for (data, labels) in dataloader:
         for x, y in zip(data, labels):
             if y == classes:
@@ -118,10 +118,11 @@ def train(classes_str, dataset_str, patches, layers, n_data_qubits, batch_size, 
             real_images = real_images.to(device)
             optimizer_C.zero_grad()
 
+            current_batch_size = real_images.shape[0]
             if randn:
-                z = torch.randn(batch_size, latent_dim, device=device)
+                z = torch.randn(current_batch_size, latent_dim, device=device)
             else:
-                z = torch.rand(batch_size, latent_dim, device=device)
+                z = torch.rand(current_batch_size, latent_dim, device=device)
             fake_images = generator(z)
 
             # Real images
@@ -171,12 +172,18 @@ def train(classes_str, dataset_str, patches, layers, n_data_qubits, batch_size, 
                     print("saved images and state")
             counter = counter + 1
             print(f'Iteration: {counter}')
+            
+            if counter % sample_interval != 0:
+                if counter == num_iterations:
+                     break
+                continue
+
             fid_fixed_images = generator(fixed_z)
             fid_real_images = new_train_data
             fid = calculate_fid(fid_fixed_images, fid_real_images)
             cos_sim = calculate_cos(fid_fixed_images, real_images)
-            a_ssim = fid_fixed_images.detach().cpu().numpy().reshape(image_size, image_size)
-            b_ssim = real_images.detach().cpu().numpy().reshape(image_size, image_size)
+            a_ssim = fid_fixed_images[0].detach().cpu().numpy().reshape(image_size, image_size)
+            b_ssim = real_images[0].detach().cpu().numpy().reshape(image_size, image_size)
             ssim = structural_similarity(a_ssim, b_ssim, data_range=1)
             psnr = peak_signal_noise_ratio(b_ssim, a_ssim)
             all_ssim.append(ssim)
@@ -195,7 +202,7 @@ def train(classes_str, dataset_str, patches, layers, n_data_qubits, batch_size, 
             np.save(f'{out_dir}/KL_{classes_str}', all_KL)
             np.save(f'{out_dir}/g_loss_{classes_str}', all_g_loss)
             np.save(f'{out_dir}/d_loss_{classes_str}', all_d_loss)
-            np.save(f'{out_dir}/cos_sim_{classes_str}', all_cos_sim)
+            np.save(f'{out_dir}/cos_sim_{classes_str}', np.array(all_cos_sim, dtype=object))
             np.save(f'{out_dir}/ssim_{classes_str}', all_ssim)
             break
 
@@ -219,7 +226,7 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--patches", help="number of sub-generators", default=4, type=int, choices=[1, 2, 4, 7, 14, 28])
     parser.add_argument("-l", "--layers", help="layers per sub-generators", default=2, type=int)
     parser.add_argument("-q", "--qubits", help="number of data qubits per sub-generator", type=int, default=5)
-    parser.add_argument("-b", "--batch_size", help="batch_size", default=1, type=int)
+    parser.add_argument("-b", "--batch_size", help="batch_size", default=16, type=int)
     parser.add_argument("-o", "--out_folder", help="output directory", default='./My-Enhanced-resutls', type=str)
     parser.add_argument("-c", "--checkpoint", help="checkpoint to load from", type=int, default=0)
     parser.add_argument("-rn", "--randn", help="use normal prior, otherwise use uniform prior", action="store_true")

@@ -34,7 +34,7 @@ class QuantumLayer(nn.Module):
             for i in range(self.n_layer):
                 qml.StronglyEntanglingLayers(weights1[i], wires=range(self.in_features), imprimitive=qml.ops.CZ)
                 for j in range(self.in_features):
-                    qml.RZ(inputs[j], wires=j)
+                    qml.RZ(inputs[..., j], wires=j)
             qml.StronglyEntanglingLayers(weights2, wires=range(self.in_features), imprimitive=qml.ops.CZ)
 
             if self.use_noise != 0:
