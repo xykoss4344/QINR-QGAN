@@ -193,7 +193,7 @@ def train(args):
                 g_loss.backward()
                 optimizer_G.step()
                 
-                if i % 100 == 0:
+                if i % 10 == 0:
                     print(f"[Epoch {epoch}/{args.n_epochs}] [Batch {i}/{len(dataloader)}] [D loss: {d_loss.item():.4f}] [G WGAN: {g_wgan_loss.item():.4f}] [G Physics: {physics_loss.item():.4f}]")
 
         # Save checkopints

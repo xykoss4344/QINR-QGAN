@@ -7,7 +7,7 @@ import random
 import glob
 
 from models.QINR_Crystal import PQWGAN_CC_Crystal
-original_repo_path = r"c:\Users\Jeremy\Documents\Projects\qgan\Composition-Conditioned-Crystal-GAN\Composition_Conditioned_Crystal_GAN"
+original_repo_path = r"c:\Users\Adminb\OneDrive\Documents\Projects\qgan\QINR-QGAN\QGAN-QIREN-2024-MNIST\datasets"
 sys.path.append(original_repo_path)
 from view_atoms_mgmno import view_atoms
 

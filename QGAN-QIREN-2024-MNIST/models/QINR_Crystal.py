@@ -55,7 +55,13 @@ class QuantumLayer(nn.Module):
         orgin_shape = list(x.shape[0:-1]) + [-1]
         if len(orgin_shape) > 2:
             x = x.reshape((-1, self.in_features))
-        out = self.qnn(x)
+            
+        # Prevent CUDA context clashes by invoking the quantum simulator explicitly on CPU
+        curr_device = x.device
+        x_cpu = x.to('cpu')
+        out_cpu = self.qnn(x_cpu)
+        out = out_cpu.to(curr_device)
+        
         return out.reshape(orgin_shape)
 
 class PQWGAN_CC_Crystal():
