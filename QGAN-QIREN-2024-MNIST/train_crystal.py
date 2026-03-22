@@ -134,7 +134,24 @@ def train(args):
     lambda_gp = 10
     n_critic = 5
     
+    # --- ADDED: Loss Tracking Lists ---
+    epoch_losses = {
+        'epoch': [],
+        'd_loss': [],
+        'g_wgan_loss': [],
+        'physics_loss': [],
+        'total_g_loss': []
+    }
+    
     for epoch in range(args.n_epochs):
+        # Accumulate losses for the epoch
+        epoch_d_loss = 0.0
+        epoch_g_wgan = 0.0
+        epoch_g_physics = 0.0
+        epoch_g_total = 0.0
+        num_g_updates = 0
+        num_d_updates = 0
+        
         for i, (real_imgs, labels) in enumerate(dataloader):
             real_imgs = real_imgs.to(device)
             labels = labels.to(device)
@@ -167,6 +184,8 @@ def train(args):
             d_loss = -torch.mean(real_validity) + torch.mean(fake_validity) + lambda_gp * gradient_penalty
             
             d_loss.backward()
+            epoch_d_loss += d_loss.item()
+            num_d_updates += 1
             optimizer_C.step()
             
             # --- Train Generator ---
@@ -193,6 +212,11 @@ def train(args):
                 g_loss.backward()
                 optimizer_G.step()
                 
+                epoch_g_wgan += g_wgan_loss.item()
+                epoch_g_physics += physics_loss.item()
+                epoch_g_total += g_loss.item()
+                num_g_updates += 1
+                
                 if i % 10 == 0:
                     print(f"[Epoch {epoch}/{args.n_epochs}] [Batch {i}/{len(dataloader)}] [D loss: {d_loss.item():.4f}] [G WGAN: {g_wgan_loss.item():.4f}] [G Physics: {physics_loss.item():.4f}]")
 
@@ -205,6 +229,29 @@ def train(args):
                 'epoch': epoch
             }, save_path)
             print(f"Saved checkpoint to {save_path}")
+            
+        # --- ADDED: Store average loss for this epoch ---
+        epoch_losses['epoch'].append(epoch)
+        epoch_losses['d_loss'].append(epoch_d_loss / max(1, num_d_updates))
+        epoch_losses['g_wgan_loss'].append(epoch_g_wgan / max(1, num_g_updates))
+        epoch_losses['physics_loss'].append(epoch_g_physics / max(1, num_g_updates))
+        epoch_losses['total_g_loss'].append(epoch_g_total / max(1, num_g_updates))
+        
+    # --- ADDED: Save final loss history as CSV ---
+    import csv
+    csv_path = os.path.join(args.out_folder, "training_loss_history.csv")
+    with open(csv_path, 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(['epoch', 'd_loss', 'g_wgan_loss', 'physics_loss', 'total_g_loss'])
+        for i in range(len(epoch_losses['epoch'])):
+            writer.writerow([
+                epoch_losses['epoch'][i],
+                epoch_losses['d_loss'][i],
+                epoch_losses['g_wgan_loss'][i],
+                epoch_losses['physics_loss'][i],
+                epoch_losses['total_g_loss'][i]
+            ])
+    print(f"Saved training loss history to {csv_path}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
