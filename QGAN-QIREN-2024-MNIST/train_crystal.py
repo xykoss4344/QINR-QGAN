@@ -65,6 +65,46 @@ def compute_distance_penalty(coords_batch, min_dist=1.0):
     penalty = torch.mean(torch.sum(violations, dim=(1,2)))
     return penalty
 
+
+class QHead(nn.Module):
+    """
+    InfoGAN-style auxiliary classifier (Q-Head).
+    Takes raw crystal coordinates (90-dim) and predicts the 28-dim binary
+    composition label in three separate branches:
+      - Mg branch: 8 slots  (indices 0:8)
+      - Mn branch: 8 slots  (indices 8:16)
+      - O  branch: 12 slots (indices 16:28)
+    Each branch outputs logits for Binary Cross-Entropy loss.
+    """
+    def __init__(self, data_dim=90, mg_slots=8, mn_slots=8, o_slots=12):
+        super().__init__()
+        hidden = 128
+        self.shared = nn.Sequential(
+            nn.Linear(data_dim, hidden),
+            nn.LeakyReLU(0.2),
+            nn.Linear(hidden, hidden),
+            nn.LeakyReLU(0.2),
+        )
+        self.mg_head = nn.Linear(hidden, mg_slots)
+        self.mn_head = nn.Linear(hidden, mn_slots)
+        self.o_head  = nn.Linear(hidden, o_slots)
+
+    def forward(self, x):
+        h = self.shared(x)
+        return self.mg_head(h), self.mn_head(h), self.o_head(h)
+
+    def composition_loss(self, coords, labels_28):
+        """
+        Compute BCE loss across all three branches.
+        labels_28: (batch, 28) binary tensor.
+        """
+        mg_logits, mn_logits, o_logits = self.forward(coords)
+        bce = nn.BCEWithLogitsLoss()
+        l_mg = bce(mg_logits, labels_28[:, 0:8])
+        l_mn = bce(mn_logits, labels_28[:, 8:16])
+        l_o  = bce(o_logits,  labels_28[:, 16:28])
+        return l_mg + l_mn + l_o
+
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -122,6 +162,9 @@ def train(args):
     
     generator = gan.generator.to(device)
     critic = gan.critic.to(device)
+
+    # --- InfoGAN Q-Head ---
+    q_head = QHead(data_dim=data_dim).to(device)
     
     lr_G = args.lr_g
     lr_D = args.lr_d
@@ -129,17 +172,19 @@ def train(args):
     b2 = 0.9
     
     optimizer_G = Adam(generator.parameters(), lr=lr_G, betas=(b1, b2))
-    optimizer_C = Adam(critic.parameters(), lr=lr_D, betas=(b1, b2))
+    optimizer_C = Adam(list(critic.parameters()) + list(q_head.parameters()), lr=lr_D, betas=(b1, b2))
     
     lambda_gp = 10
     n_critic = 5
     
-    # --- ADDED: Loss Tracking Lists ---
+    # --- Loss Tracking Lists ---
     epoch_losses = {
         'epoch': [],
         'd_loss': [],
         'g_wgan_loss': [],
         'physics_loss': [],
+        'q_real_loss': [],
+        'q_fake_loss': [],
         'total_g_loss': []
     }
     
@@ -148,6 +193,8 @@ def train(args):
         epoch_d_loss = 0.0
         epoch_g_wgan = 0.0
         epoch_g_physics = 0.0
+        epoch_q_real = 0.0
+        epoch_q_fake = 0.0
         epoch_g_total = 0.0
         num_g_updates = 0
         num_d_updates = 0
@@ -179,12 +226,18 @@ def train(args):
             # Gradient Penalty
             gradient_penalty = compute_gradient_penalty(critic, real_imgs, fake_imgs, labels, device)
 
-            
-            # Adversarial Loss
-            d_loss = -torch.mean(real_validity) + torch.mean(fake_validity) + lambda_gp * gradient_penalty
+            # --- InfoGAN Q loss on REAL samples ---
+            # The Q-Head must be able to recover the true composition from real crystals.
+            # This anchors the Q-Head to the real data distribution first.
+            q_real_loss = q_head.composition_loss(real_imgs, labels)
+
+            # Total Discriminator / Critic loss:
+            # L_D = D_fake - (D_real - L_Q_real) + GP
+            d_loss = (-torch.mean(real_validity) + q_real_loss) + torch.mean(fake_validity) + lambda_gp * gradient_penalty
             
             d_loss.backward()
             epoch_d_loss += d_loss.item()
+            epoch_q_real += q_real_loss.item()
             num_d_updates += 1
             optimizer_C.step()
             
@@ -205,50 +258,66 @@ def train(args):
                 
                 # Physics-Informed Loss
                 physics_loss = compute_distance_penalty(fake_imgs, min_dist=args.min_dist)
-                
-                # Total Generator Loss
-                g_loss = g_wgan_loss + (args.lambda_physics * physics_loss)
+
+                # --- InfoGAN Q loss on FAKE samples ---
+                # The Generator is penalised if the Q-Head cannot recover
+                # the correct composition label from the generated crystal.
+                # This enforces composition consistency.
+                q_fake_loss = q_head.composition_loss(fake_imgs.detach(), labels)
+
+                # Total Generator Loss:
+                # L_G = -G + lambda_physics * physics + lambda_info * Q_fake
+                g_loss = g_wgan_loss + (args.lambda_physics * physics_loss) + (args.lambda_info * q_fake_loss)
                 
                 g_loss.backward()
                 optimizer_G.step()
                 
-                epoch_g_wgan += g_wgan_loss.item()
+                epoch_g_wgan    += g_wgan_loss.item()
                 epoch_g_physics += physics_loss.item()
-                epoch_g_total += g_loss.item()
-                num_g_updates += 1
+                epoch_q_fake    += q_fake_loss.item()
+                epoch_g_total   += g_loss.item()
+                num_g_updates   += 1
                 
                 if i % 10 == 0:
-                    print(f"[Epoch {epoch}/{args.n_epochs}] [Batch {i}/{len(dataloader)}] [D loss: {d_loss.item():.4f}] [G WGAN: {g_wgan_loss.item():.4f}] [G Physics: {physics_loss.item():.4f}]")
+                    print(f"[Epoch {epoch}/{args.n_epochs}] [Batch {i}/{len(dataloader)}] "
+                          f"[D: {d_loss.item():.3f}] [G WGAN: {g_wgan_loss.item():.3f}] "
+                          f"[Physics: {physics_loss.item():.3f}] "
+                          f"[Q_real: {q_real_loss.item():.3f}] [Q_fake: {q_fake_loss.item():.3f}]")
 
-        # Save checkopints
+        # Save checkpoints
         if epoch % args.save_interval == 0:
             save_path = os.path.join(args.out_folder, f"checkpoint_{epoch}.pt")
             torch.save({
                 'generator': generator.state_dict(),
                 'critic': critic.state_dict(),
+                'q_head': q_head.state_dict(),
                 'epoch': epoch
             }, save_path)
             print(f"Saved checkpoint to {save_path}")
             
-        # --- ADDED: Store average loss for this epoch ---
+        # --- Store average loss for this epoch ---
         epoch_losses['epoch'].append(epoch)
         epoch_losses['d_loss'].append(epoch_d_loss / max(1, num_d_updates))
         epoch_losses['g_wgan_loss'].append(epoch_g_wgan / max(1, num_g_updates))
         epoch_losses['physics_loss'].append(epoch_g_physics / max(1, num_g_updates))
+        epoch_losses['q_real_loss'].append(epoch_q_real / max(1, num_d_updates))
+        epoch_losses['q_fake_loss'].append(epoch_q_fake / max(1, num_g_updates))
         epoch_losses['total_g_loss'].append(epoch_g_total / max(1, num_g_updates))
         
-    # --- ADDED: Save final loss history as CSV ---
+    # --- Save final loss history as CSV ---
     import csv
     csv_path = os.path.join(args.out_folder, "training_loss_history.csv")
     with open(csv_path, 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow(['epoch', 'd_loss', 'g_wgan_loss', 'physics_loss', 'total_g_loss'])
+        writer.writerow(['epoch', 'd_loss', 'g_wgan_loss', 'physics_loss', 'q_real_loss', 'q_fake_loss', 'total_g_loss'])
         for i in range(len(epoch_losses['epoch'])):
             writer.writerow([
                 epoch_losses['epoch'][i],
                 epoch_losses['d_loss'][i],
                 epoch_losses['g_wgan_loss'][i],
                 epoch_losses['physics_loss'][i],
+                epoch_losses['q_real_loss'][i],
+                epoch_losses['q_fake_loss'][i],
                 epoch_losses['total_g_loss'][i]
             ])
     print(f"Saved training loss history to {csv_path}")
@@ -269,6 +338,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_interval", type=int, default=10)
     parser.add_argument("--lambda_physics", type=float, default=5.0, help="Weight of the interatomic distance penalty")
     parser.add_argument("--min_dist", type=float, default=1.0, help="Minimum accepted distance between atoms")
+    parser.add_argument("--lambda_info", type=float, default=0.3, help="Weight of the InfoGAN Q-Head composition loss")
     
     args = parser.parse_args()
     

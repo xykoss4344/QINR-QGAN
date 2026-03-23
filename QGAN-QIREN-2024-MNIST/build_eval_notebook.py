@@ -273,7 +273,10 @@ cells.append(nbf.v4.new_markdown_cell("""\
 **To enable:** Set your free Materials Project API key: `$env:MP_API_KEY = "your_key_here"`"""))
 
 cells.append(nbf.v4.new_code_cell("""\
-MP_API_KEY = os.environ.get("MP_API_KEY")
+import os
+import numpy as np
+MP_API_KEY = os.environ.get('MP_API_KEY', 'hDXXoVT3jdqAXiIan4F9QK9J1Bc7gAGA')
+
 
 if EHULL_OK and MP_API_KEY and PYMATGEN_OK:
     from pymatgen.entries.computed_entries import ComputedEntry
