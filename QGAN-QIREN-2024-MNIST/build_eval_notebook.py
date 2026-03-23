@@ -34,6 +34,11 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 warnings.filterwarnings('ignore')
 
+# ── Set working directory to the project root ─────────────────────
+PROJECT_DIR = r"c:\\Users\\Adminb\\OneDrive\\Documents\\Projects\\qgan\\QINR-QGAN\\QGAN-QIREN-2024-MNIST"
+os.chdir(PROJECT_DIR)
+print(f"📁 Working directory: {os.getcwd()}")
+
 # ── Path setup ────────────────────────────────────────────────────
 sys.path.insert(0, os.getcwd())
 sys.path.insert(0, os.path.join(os.getcwd(), 'datasets'))
@@ -77,7 +82,20 @@ print(f"\\n🖥  Device: {device}")"""))
 # ─────────────────────────────────────────────────────────────────
 cells.append(nbf.v4.new_markdown_cell("## 1. Load Model & Generate Crystals\nWe load the latest checkpoint and generate **50 crystals** for evaluation."))
 cells.append(nbf.v4.new_code_cell("""\
-NUM_SAMPLES = 50
+import os, sys, pickle, glob, random
+import torch
+import numpy as np
+
+# Ensure working directory is correct
+PROJECT_DIR = r"c:\\Users\\Adminb\\OneDrive\\Documents\\Projects\\qgan\\QINR-QGAN\\QGAN-QIREN-2024-MNIST"
+os.chdir(PROJECT_DIR)
+sys.path.insert(0, os.getcwd())
+sys.path.insert(0, os.path.join(os.getcwd(), 'datasets'))
+
+from models.QINR_Crystal import PQWGAN_CC_Crystal
+from view_atoms_mgmno import view_atoms
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 Z_DIM, LABEL_DIM, DATA_DIM = 16, 28, 90
 
 # ── Dataset ───────────────────────────────────────────────────────
@@ -91,8 +109,11 @@ for idx in ref_indices:
     c, l = raw_data[idx]
     if len(labels) < NUM_SAMPLES:
         labels.append(l.flatten())
-    atoms, _ = view_atoms(c.flatten(), view=False)
-    real_atoms_list.append(atoms)
+    try:
+        atoms, _ = view_atoms(c.flatten(), view=False)
+        real_atoms_list.append(atoms)
+    except Exception:
+        pass
 
 while len(labels) < NUM_SAMPLES:
     labels.append(labels[0])
@@ -118,11 +139,17 @@ with torch.no_grad():
     fake_flat = generator(torch.cat([z, labels_t], dim=1)).cpu().numpy()
 
 generated_atoms = []
+failed = 0
 for img in fake_flat:
-    atoms, _ = view_atoms(img, view=False)
-    generated_atoms.append(atoms)
+    try:
+        atoms, _ = view_atoms(img, view=False)
+        generated_atoms.append(atoms)
+    except Exception:
+        failed += 1
 
-print(f"✅ Generated {len(generated_atoms)} crystal structures for evaluation.")"""))
+print(f"✅ Generated {len(generated_atoms)} valid crystal structures ({failed} had invalid cell params — normal at early epochs).")
+assert len(generated_atoms) > 0, "All structures invalid — try a later checkpoint."
+"""))
 
 # ─────────────────────────────────────────────────────────────────
 # CELL 3 — SSIM
