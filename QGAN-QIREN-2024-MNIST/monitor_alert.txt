@@ -1,0 +1,1 @@
+[CLASSICAL] STUCK at epoch 499: W range=0.00223

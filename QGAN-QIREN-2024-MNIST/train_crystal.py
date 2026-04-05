@@ -10,23 +10,22 @@ from torch.optim import Adam
 import torch.autograd as autograd
 from models.QINR_Crystal import PQWGAN_CC_Crystal
 
-def compute_gradient_penalty(dict_D, real_samples, fake_samples, labels, device):
-    """Calculates the gradient penalty loss for WGAN GP"""
-    # Random weight term for interpolation between real and fake samples
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gradient Penalty (WGAN-GP)
+# ─────────────────────────────────────────────────────────────────────────────
+def compute_gradient_penalty(critic, real_samples, fake_samples, labels, device):
+    """
+    Gradient penalty from Gulrajani et al. (2017).
+    Enforces the 1-Lipschitz constraint on the classical critic.
+    lambda_gp = 10 is applied at the call site.
+    """
     alpha = torch.rand(real_samples.size(0), 1).to(device)
-    # Get random interpolation between real and fake samples
-    interpolates = (alpha * real_samples + ((1 - alpha) * fake_samples)).requires_grad_(True)
-    
-    # Conditional Critic takes data + labels
-    # We concat in the forward pass of Critic or here?
-    # Our ClassicalCritic takes 'input_dim' which is data_dim + label_dim
-    # So we need to concat before passing
+    interpolates = (alpha * real_samples + (1 - alpha) * fake_samples).requires_grad_(True)
     interpolates_cond = torch.cat([interpolates, labels], dim=1)
-    d_interpolates = dict_D(interpolates_cond)
-    
+    d_interpolates = critic(interpolates_cond)
+
     fake = torch.ones(real_samples.shape[0], 1).to(device).requires_grad_(False)
-    
-    # Get gradient w.r.t. interpolates
     gradients = autograd.grad(
         outputs=d_interpolates,
         inputs=interpolates,
@@ -35,312 +34,348 @@ def compute_gradient_penalty(dict_D, real_samples, fake_samples, labels, device)
         retain_graph=True,
         only_inputs=True,
     )[0]
-    
     gradients = gradients.view(gradients.size(0), -1)
     gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
     return gradient_penalty
 
-def compute_distance_penalty(coords_batch, min_dist=1.0):
-    """
-    Computes a physics-informed penalty for interatomic distances < min_dist.
-    coords_batch: shape (batch_size, 90) representing (batch_size, 30 atoms, 3 coords)
-    """
-    batch_size = coords_batch.shape[0]
-    # Reshape to (batch, 30 atoms, 3 xyz coords)
-    coords = coords_batch.view(batch_size, 30, 3)
-    
-    # Calculate pairwise Euclidean distances
-    diff = coords.unsqueeze(2) - coords.unsqueeze(1) # shape (batch, 30, 30, 3)
-    # Add epsilon to prevent NaN gradients from sqrt(0)
-    distances = torch.sqrt(torch.sum(diff**2, dim=-1) + 1e-8) # shape (batch, 30, 30)
-    
-    # Mask out diagonal (distance from an atom to itself)
-    mask = torch.eye(30, device=coords.device).unsqueeze(0).expand(batch_size, -1, -1).bool()
-    distances_masked = distances.masked_fill(mask, float('inf'))
-    
-    # Violations: any distance less than min_dist
-    violations = torch.relu(min_dist - distances_masked)
-    
-    # Sum violations across atoms, mean across the batch
-    penalty = torch.mean(torch.sum(violations, dim=(1,2)))
-    return penalty
 
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Q-Head — Slot + Count branches (InfoGAN auxiliary classifier)
+# ─────────────────────────────────────────────────────────────────────────────
 class QHead(nn.Module):
     """
-    InfoGAN-style auxiliary classifier (Q-Head).
-    Takes raw crystal coordinates (90-dim) and predicts the 28-dim binary
-    composition label in three separate branches:
-      - Mg branch: 8 slots  (indices 0:8)
-      - Mn branch: 8 slots  (indices 8:16)
-      - O  branch: 12 slots (indices 16:28)
-    Each branch outputs logits for Binary Cross-Entropy loss.
+    InfoGAN-style auxiliary classifier attached to the critic.
+
+    Input  : raw crystal coordinate vector (90-dim).
+    Outputs:
+      Slot predictions  — binary occupancy per slot (28 logits, BCE)
+        mg_slot  : 8 logits   (indices 0:8)
+        mn_slot  : 8 logits   (indices 8:16)
+        o_slot   : 12 logits  (indices 16:28)
+      Count predictions — total atom count per element (multi-class, CE)
+        mg_count : 9 logits   (n_Mg  ∈ {0…8})
+        mn_count : 9 logits   (n_Mn  ∈ {0…8})
+        o_count  : 13 logits  (n_O   ∈ {0…12})
     """
-    def __init__(self, data_dim=90, mg_slots=8, mn_slots=8, o_slots=12):
+    MG_SLOTS = 8;  MN_SLOTS = 8;  O_SLOTS = 12
+    MG_CLASSES = 9; MN_CLASSES = 9; O_CLASSES = 13   # 0…8 and 0…12
+
+    def __init__(self, data_dim=90):
         super().__init__()
-        hidden = 128
+        hidden = 256
         self.shared = nn.Sequential(
             nn.Linear(data_dim, hidden),
             nn.LeakyReLU(0.2),
             nn.Linear(hidden, hidden),
             nn.LeakyReLU(0.2),
         )
-        self.mg_head = nn.Linear(hidden, mg_slots)
-        self.mn_head = nn.Linear(hidden, mn_slots)
-        self.o_head  = nn.Linear(hidden, o_slots)
+        # Slot branches (binary occupancy)
+        self.mg_slot  = nn.Linear(hidden, self.MG_SLOTS)
+        self.mn_slot  = nn.Linear(hidden, self.MN_SLOTS)
+        self.o_slot   = nn.Linear(hidden, self.O_SLOTS)
+        # Count branches (multi-class)
+        self.mg_count = nn.Linear(hidden, self.MG_CLASSES)
+        self.mn_count = nn.Linear(hidden, self.MN_CLASSES)
+        self.o_count  = nn.Linear(hidden, self.O_CLASSES)
 
     def forward(self, x):
         h = self.shared(x)
-        return self.mg_head(h), self.mn_head(h), self.o_head(h)
+        return (
+            self.mg_slot(h),   self.mn_slot(h),   self.o_slot(h),
+            self.mg_count(h),  self.mn_count(h),  self.o_count(h),
+        )
 
-    def composition_loss(self, coords, labels_28):
+    @staticmethod
+    def _count_targets(labels_28):
+        """Derive integer count targets from 28-dim binary slot labels."""
+        n_mg = labels_28[:, 0:8].sum(dim=1).long().clamp(0, 8)
+        n_mn = labels_28[:, 8:16].sum(dim=1).long().clamp(0, 8)
+        n_o  = labels_28[:, 16:28].sum(dim=1).long().clamp(0, 12)
+        return n_mg, n_mn, n_o
+
+    def q_real_loss(self, coords, labels_28):
         """
-        Compute BCE loss across all three branches.
-        labels_28: (batch, 28) binary tensor.
+        L_Q_real = CE_slot(Mg) + CE_slot(Mn) + CE_slot(O)
+                 + 0.3 * [CE_count(Mg) + CE_count(Mn) + CE_count(O)]
+
+        Used inside D loss:  L_D = L_critic + L_gp - L_Q_real
+        Subtracting rewards D (and Q-Head) for accurately predicting
+        composition from real crystals.
         """
-        mg_logits, mn_logits, o_logits = self.forward(coords)
+        mg_s, mn_s, o_s, mg_c, mn_c, o_c = self.forward(coords)
         bce = nn.BCEWithLogitsLoss()
-        l_mg = bce(mg_logits, labels_28[:, 0:8])
-        l_mn = bce(mn_logits, labels_28[:, 8:16])
-        l_o  = bce(o_logits,  labels_28[:, 16:28])
-        return l_mg + l_mn + l_o
+        ce  = nn.CrossEntropyLoss()
+        n_mg, n_mn, n_o = self._count_targets(labels_28)
 
+        slot_loss  = (bce(mg_s, labels_28[:, 0:8])
+                    + bce(mn_s, labels_28[:, 8:16])
+                    + bce(o_s,  labels_28[:, 16:28]))
+        count_loss = (ce(mg_c, n_mg) + ce(mn_c, n_mn) + ce(o_c, n_o))
+        return slot_loss + 0.3 * count_loss
+
+    def q_fake_loss(self, coords, labels_28):
+        """
+        L_Q_fake = 0.3 * [CE_count(Mg) + CE_count(Mn) + CE_count(O)]
+
+        Used inside G loss:  L_G = -E[D(G(z))] + L_Q_fake
+        Penalises the quantum generator if the Q-Head cannot recover
+        the correct atom-count composition from the generated crystal.
+        """
+        _, _, _, mg_c, mn_c, o_c = self.forward(coords)
+        ce = nn.CrossEntropyLoss()
+        n_mg, n_mn, n_o = self._count_targets(labels_28)
+        return 0.01 * (ce(mg_c, n_mg) + ce(mn_c, n_mn) + ce(o_c, n_o))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Training
+# ─────────────────────────────────────────────────────────────────────────────
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Load Dataset
+    # ── Dataset ──────────────────────────────────────────────────────────────
     print(f"Loading dataset from {args.dataset_path}")
     with open(args.dataset_path, 'rb') as f:
         raw_data = pickle.load(f)
-    
-    # Format: List of (coords, labels)
-    # coords: (30, 3) -> flatten to 90
-    # labels: (28, 1) -> flatten to 28
-    
-    train_data_coords = []
-    train_data_labels = []
-    
+
+    train_data_coords, train_data_labels = [], []
     for c, l in raw_data:
-        train_data_coords.append(c.flatten())
-        train_data_labels.append(l.flatten())
-        
+        train_data_coords.append(np.array(c).flatten())
+        train_data_labels.append(np.array(l).flatten())
+
     train_data_coords = np.array(train_data_coords, dtype=np.float32)
     train_data_labels = np.array(train_data_labels, dtype=np.float32)
-    
-    # Normalize coords? They look like fractional coordinates [0,1], but some are 0.
-    # WGAN usually works better with [-1, 1] or [0, 1].
-    # Let's assume they are in [0, 1].
-    
-    dataset = TensorDataset(torch.from_numpy(train_data_coords), torch.from_numpy(train_data_labels))
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
-    
-    data_dim = 90
-    label_dim = 28
-    z_dim = args.z_dim
-    hidden_features = args.hidden_features # Qubits
-    hidden_layers = args.hidden_layers
-    spectrum = args.spectrum_layer
-    use_noise = args.use_noise
-    
-    # Generator Input: z + label
-    gen_input_dim = z_dim + label_dim
-    
-    # Critic Input: data + label
-    critic_input_dim = data_dim + label_dim
-    
-    print(f"Initializing QINR Crystal Model...")
-    gan = PQWGAN_CC_Crystal(
-        input_dim_g=gen_input_dim,
-        output_dim=data_dim,
-        input_dim_d=critic_input_dim,
-        hidden_features=hidden_features,
-        hidden_layers=hidden_layers,
-        spectrum_layer=spectrum,
-        use_noise=use_noise
-    )
-    
-    generator = gan.generator.to(device)
-    critic = gan.critic.to(device)
 
-    # --- InfoGAN Q-Head ---
-    q_head = QHead(data_dim=data_dim).to(device)
-    
-    lr_G = args.lr_g
-    lr_D = args.lr_d
-    b1 = 0.0
-    b2 = 0.9
-    
-    optimizer_G = Adam(generator.parameters(), lr=lr_G, betas=(b1, b2))
-    optimizer_C = Adam(list(critic.parameters()) + list(q_head.parameters()), lr=lr_D, betas=(b1, b2))
-    
-    lambda_gp = 10
-    n_critic = 5
-    
-    # --- Loss Tracking Lists ---
+    dataset    = TensorDataset(torch.from_numpy(train_data_coords),
+                               torch.from_numpy(train_data_labels))
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+
+    data_dim  = 90
+    label_dim = 28
+    z_dim     = args.z_dim
+
+    # ── Model ─────────────────────────────────────────────────────────────────
+    gen_input_dim    = z_dim + label_dim        # generator: noise + label
+    critic_input_dim = data_dim + label_dim     # critic:    data  + label
+    print("Initializing QINR Crystal Model...")
+    gan = PQWGAN_CC_Crystal(
+        input_dim_g   = gen_input_dim,
+        output_dim    = data_dim,
+        input_dim_d   = critic_input_dim,
+        hidden_features = args.hidden_features,
+        hidden_layers   = args.hidden_layers,
+        spectrum_layer  = args.spectrum_layer,
+        use_noise       = args.use_noise,
+    )
+
+    generator = gan.generator.to(device)
+    critic    = gan.critic.to(device)
+    q_head    = QHead(data_dim=data_dim).to(device)
+
+    # ── Optimizers ────────────────────────────────────────────────────────────
+    # Per specification: lr_critic=0.00005, lr_generator=0.000025
+    optimizer_C = Adam(critic.parameters(), lr=args.lr_d, betas=(0.0, 0.9))
+    optimizer_Q = Adam(q_head.parameters(), lr=args.lr_d, betas=(0.0, 0.9))
+    optimizer_G = Adam(generator.parameters(), lr=args.lr_g, betas=(0.0, 0.9))
+
+    lambda_gp   = 10
+    n_critic    = 3
+    # Cell geometry MSE: pushes generated cell params toward real distribution.
+    # Targets: lengths (indices 0-2) ~ real batch, angles (indices 3-5) ~ real batch.
+    # Weight ramps from 0 -> lambda_cell over warmup_cell epochs so the WGAN
+    # signal stabilises before cell supervision is fully applied.
+    lambda_cell  = args.lambda_cell
+    warmup_cell  = 30   # epochs before full cell weight
+
+    # ── Loss tracking ─────────────────────────────────────────────────────────
     epoch_losses = {
-        'epoch': [],
-        'd_loss': [],
-        'g_wgan_loss': [],
-        'physics_loss': [],
-        'q_real_loss': [],
-        'q_fake_loss': [],
-        'total_g_loss': []
+        'epoch': [], 'd_loss': [], 'wasserstein': [],
+        'q_real_loss': [], 'q_fake_loss': [], 'cell_loss': [], 'total_g_loss': []
     }
-    
-    for epoch in range(args.n_epochs):
-        # Accumulate losses for the epoch
-        epoch_d_loss = 0.0
-        epoch_g_wgan = 0.0
-        epoch_g_physics = 0.0
-        epoch_q_real = 0.0
-        epoch_q_fake = 0.0
-        epoch_g_total = 0.0
-        num_g_updates = 0
-        num_d_updates = 0
-        
+
+    start_epoch = 0
+    if args.resume_checkpoint and os.path.exists(args.resume_checkpoint):
+        print(f"Resuming from {args.resume_checkpoint}...")
+        ckpt = torch.load(args.resume_checkpoint, map_location=device)
+        generator.load_state_dict(ckpt['generator'])
+        critic.load_state_dict(ckpt['critic'])
+        q_head.load_state_dict(ckpt['q_head'])
+        start_epoch = ckpt['epoch'] + 1
+        print(f"Resumed at epoch {start_epoch}")
+
+    for epoch in range(start_epoch, args.n_epochs):
+        ep_d = ep_w = ep_qr = ep_qf = ep_cell = ep_g = 0.0
+        cell_w = min(1.0, epoch / max(warmup_cell, 1)) * lambda_cell
+        n_d = n_g = 0
+
         for i, (real_imgs, labels) in enumerate(dataloader):
             real_imgs = real_imgs.to(device)
-            labels = labels.to(device)
-            current_batch_size = real_imgs.shape[0]
-            
-            # --- Train Critic ---
+            labels    = labels.to(device)
+            bs        = real_imgs.shape[0]
+
+            # ── Critic step ───────────────────────────────────────────────
             optimizer_C.zero_grad()
-            
-            # Sample noise
-            z = torch.randn(current_batch_size, z_dim).to(device)
-            
-            # Generate fake images (Conditioned)
+            optimizer_Q.zero_grad()
+
+            z         = torch.randn(bs, z_dim).to(device)
             gen_input = torch.cat([z, labels], dim=1)
-            fake_imgs = generator(gen_input)
-            
-            # Critic score for Real (Conditioned)
-            critic_input_real = torch.cat([real_imgs, labels], dim=1)
-            real_validity = critic(critic_input_real)
-            
-            # Critic score for Fake (Conditioned)
-            critic_input_fake = torch.cat([fake_imgs, labels], dim=1)
-            fake_validity = critic(critic_input_fake)
-            
+            fake_imgs = generator(gen_input).detach()   # no G gradients here
 
-            # Gradient Penalty
-            gradient_penalty = compute_gradient_penalty(critic, real_imgs, fake_imgs, labels, device)
+            real_cond = torch.cat([real_imgs, labels], dim=1)
+            fake_cond = torch.cat([fake_imgs, labels], dim=1)
+            d_real    = critic(real_cond)
+            d_fake    = critic(fake_cond)
 
-            # --- InfoGAN Q loss on REAL samples ---
-            # The Q-Head must be able to recover the true composition from real crystals.
-            # This anchors the Q-Head to the real data distribution first.
-            q_real_loss = q_head.composition_loss(real_imgs, labels)
+            gp         = compute_gradient_penalty(critic, real_imgs, fake_imgs, labels, device)
+            l_critic   = torch.mean(d_fake) - torch.mean(d_real)
+            wasserstein = torch.mean(d_real) - torch.mean(d_fake)   # logged
 
-            # Total Discriminator / Critic loss:
-            # L_D = D_fake - (D_real - L_Q_real) + GP
-            d_loss = (-torch.mean(real_validity) + q_real_loss) + torch.mean(fake_validity) + lambda_gp * gradient_penalty
-            
+            # Q-Head composition loss on REAL structures
+            l_q_real = q_head.q_real_loss(real_imgs, labels)
+
+            # Total D loss — matches classical GAN loss structure:
+            #   classical: -(D_real - cat_loss_real) + D_fake + GP
+            #            = l_critic + GP + cat_loss_real
+            # The classical cat_loss_real is bounded CE (≤8.5).
+            # QGAN's BCE+CE can grow to thousands, so we scale by 0.01
+            # to keep it comparable in magnitude to the Wasserstein term.
+            d_loss = l_critic + lambda_gp * gp + 0.001 * l_q_real
+
             d_loss.backward()
-            epoch_d_loss += d_loss.item()
-            epoch_q_real += q_real_loss.item()
-            num_d_updates += 1
             optimizer_C.step()
-            
-            # --- Train Generator ---
+            optimizer_Q.step()
+
+            ep_d  += d_loss.item()
+            ep_w  += wasserstein.item()
+            ep_qr += l_q_real.item()
+            n_d   += 1
+
+            # ── Generator step (every n_critic critic steps) ───────────────
             if i % n_critic == 0:
                 optimizer_G.zero_grad()
-                
-                # Generate fake images
-                z = torch.randn(current_batch_size, z_dim).to(device)
+
+                z         = torch.randn(bs, z_dim).to(device)
                 gen_input = torch.cat([z, labels], dim=1)
                 fake_imgs = generator(gen_input)
-                
-                # Score with Critic
-                critic_input_fake = torch.cat([fake_imgs, labels], dim=1)
-                fake_validity = critic(critic_input_fake)
-                
-                g_wgan_loss = -torch.mean(fake_validity)
-                
-                # Physics-Informed Loss
-                physics_loss = compute_distance_penalty(fake_imgs, min_dist=args.min_dist)
 
-                # --- InfoGAN Q loss on FAKE samples ---
-                # The Generator is penalised if the Q-Head cannot recover
-                # the correct composition label from the generated crystal.
-                # This enforces composition consistency.
-                q_fake_loss = q_head.composition_loss(fake_imgs.detach(), labels)
+                fake_cond    = torch.cat([fake_imgs, labels], dim=1)
+                d_fake_for_g = critic(fake_cond)
+                g_wgan       = -torch.mean(d_fake_for_g)
 
-                # Total Generator Loss:
-                # L_G = -G + lambda_physics * physics + lambda_info * Q_fake
-                g_loss = g_wgan_loss + (args.lambda_physics * physics_loss) + (args.lambda_info * q_fake_loss)
-                
+                # Q-Head composition loss on FAKE structures
+                l_q_fake = q_head.q_fake_loss(fake_imgs, labels)
+
+                # Cell geometry MSE: penalise deviation of generated cell params
+                # (first 6 outputs) from the real batch's cell params.
+                # Ramps up over warmup_cell epochs so WGAN stabilises first.
+                l_cell = nn.functional.mse_loss(
+                    fake_imgs[:, :6], real_imgs[:, :6]
+                )
+
+                # Total G loss: WGAN + composition + cell geometry
+                g_loss = g_wgan + l_q_fake + cell_w * l_cell
+
                 g_loss.backward()
                 optimizer_G.step()
-                
-                epoch_g_wgan    += g_wgan_loss.item()
-                epoch_g_physics += physics_loss.item()
-                epoch_q_fake    += q_fake_loss.item()
-                epoch_g_total   += g_loss.item()
-                num_g_updates   += 1
-                
+
+                ep_qf   += l_q_fake.item()
+                ep_cell += l_cell.item()
+                ep_g    += g_loss.item()
+                n_g     += 1
+
                 if i % 10 == 0:
                     print(f"[Epoch {epoch}/{args.n_epochs}] [Batch {i}/{len(dataloader)}] "
-                          f"[D: {d_loss.item():.3f}] [G WGAN: {g_wgan_loss.item():.3f}] "
-                          f"[Physics: {physics_loss.item():.3f}] "
-                          f"[Q_real: {q_real_loss.item():.3f}] [Q_fake: {q_fake_loss.item():.3f}]")
+                          f"[D: {d_loss.item():.3f}] [W: {wasserstein.item():.3f}] "
+                          f"[Q_real: {l_q_real.item():.3f}] [Q_fake: {l_q_fake.item():.3f}] "
+                          f"[Cell: {l_cell.item():.4f}] [cell_w: {cell_w:.2f}]")
 
-        # Save checkpoints
+        # ── Checkpoint ────────────────────────────────────────────────────────
         if epoch % args.save_interval == 0:
             save_path = os.path.join(args.out_folder, f"checkpoint_{epoch}.pt")
             torch.save({
                 'generator': generator.state_dict(),
-                'critic': critic.state_dict(),
-                'q_head': q_head.state_dict(),
-                'epoch': epoch
+                'critic':    critic.state_dict(),
+                'q_head':    q_head.state_dict(),
+                'epoch':     epoch,
             }, save_path)
             print(f"Saved checkpoint to {save_path}")
-            
-        # --- Store average loss for this epoch ---
+
+        # ── LR decay — matches classical GAN: lr *= 0.99 every 10 epochs ────────
+        if (epoch + 1) % 10 == 0:
+            for opt_x in [optimizer_C, optimizer_Q, optimizer_G]:
+                for pg in opt_x.param_groups:
+                    pg['lr'] *= 0.99
+
         epoch_losses['epoch'].append(epoch)
-        epoch_losses['d_loss'].append(epoch_d_loss / max(1, num_d_updates))
-        epoch_losses['g_wgan_loss'].append(epoch_g_wgan / max(1, num_g_updates))
-        epoch_losses['physics_loss'].append(epoch_g_physics / max(1, num_g_updates))
-        epoch_losses['q_real_loss'].append(epoch_q_real / max(1, num_d_updates))
-        epoch_losses['q_fake_loss'].append(epoch_q_fake / max(1, num_g_updates))
-        epoch_losses['total_g_loss'].append(epoch_g_total / max(1, num_g_updates))
-        
-    # --- Save final loss history as CSV ---
+        epoch_losses['d_loss'].append(ep_d    / max(1, n_d))
+        epoch_losses['wasserstein'].append(ep_w    / max(1, n_d))
+        epoch_losses['q_real_loss'].append(ep_qr   / max(1, n_d))
+        epoch_losses['q_fake_loss'].append(ep_qf   / max(1, n_g))
+        epoch_losses['cell_loss'].append(ep_cell / max(1, n_g))
+        epoch_losses['total_g_loss'].append(ep_g    / max(1, n_g))
+
+        # ── Plateau detection ─────────────────────────────────────────────────
+        if args.plateau_window > 0 and len(epoch_losses['wasserstein']) >= args.plateau_window:
+            recent_w = epoch_losses['wasserstein'][-args.plateau_window:]
+            w_range  = max(recent_w) - min(recent_w)
+            if w_range < args.plateau_tol:
+                flag_path = os.path.join(args.out_folder, "PLATEAU_FLAG.txt")
+                msg = (f"[PLATEAU] Epoch {epoch}: W-loss range={w_range:.5f} "
+                       f"over last {args.plateau_window} epochs (tol={args.plateau_tol}). "
+                       f"W_mean={sum(recent_w)/len(recent_w):.4f}")
+                print(f"\n{'!'*60}", flush=True)
+                print(msg, flush=True)
+                print(f"{'!'*60}\n", flush=True)
+                with open(flag_path, 'w') as _fp:
+                    _fp.write(msg + '\n')
+            else:
+                # Clear flag if loss is moving again
+                flag_path = os.path.join(args.out_folder, "PLATEAU_FLAG.txt")
+                if os.path.exists(flag_path):
+                    os.remove(flag_path)
+
+    # ── Save loss CSV ─────────────────────────────────────────────────────────
     import csv
     csv_path = os.path.join(args.out_folder, "training_loss_history.csv")
-    with open(csv_path, 'w', newline='') as csvfile:
-        writer = csv.writer(csvfile)
-        writer.writerow(['epoch', 'd_loss', 'g_wgan_loss', 'physics_loss', 'q_real_loss', 'q_fake_loss', 'total_g_loss'])
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['epoch', 'd_loss', 'wasserstein', 'q_real_loss', 'q_fake_loss', 'cell_loss', 'total_g_loss'])
         for i in range(len(epoch_losses['epoch'])):
-            writer.writerow([
-                epoch_losses['epoch'][i],
-                epoch_losses['d_loss'][i],
-                epoch_losses['g_wgan_loss'][i],
-                epoch_losses['physics_loss'][i],
-                epoch_losses['q_real_loss'][i],
-                epoch_losses['q_fake_loss'][i],
-                epoch_losses['total_g_loss'][i]
-            ])
+            writer.writerow([epoch_losses['epoch'][i],
+                             epoch_losses['d_loss'][i],
+                             epoch_losses['wasserstein'][i],
+                             epoch_losses['q_real_loss'][i],
+                             epoch_losses['q_fake_loss'][i],
+                             epoch_losses['cell_loss'][i],
+                             epoch_losses['total_g_loss'][i]])
     print(f"Saved training loss history to {csv_path}")
 
+
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset_path", type=str, default=r"datasets\mgmno_100.pickle")
-    parser.add_argument("--n_epochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--z_dim", type=int, default=16)
-    parser.add_argument("--hidden_features", type=int, default=6) # Qubits
-    parser.add_argument("--hidden_layers", type=int, default=2)
-    parser.add_argument("--spectrum_layer", type=int, default=2)
-    parser.add_argument("--use_noise", type=float, default=0.0)
-    parser.add_argument("--lr_g", type=float, default=0.0001)
-    parser.add_argument("--lr_d", type=float, default=0.0001)
-    parser.add_argument("--out_folder", type=str, default="./results_crystal_qgan")
-    parser.add_argument("--save_interval", type=int, default=10)
-    parser.add_argument("--lambda_physics", type=float, default=5.0, help="Weight of the interatomic distance penalty")
-    parser.add_argument("--min_dist", type=float, default=1.0, help="Minimum accepted distance between atoms")
-    parser.add_argument("--lambda_info", type=float, default=0.3, help="Weight of the InfoGAN Q-Head composition loss")
-    
+    parser.add_argument("--dataset_path",    type=str,   default=r"datasets\mgmno_100_aug.pickle")
+    parser.add_argument("--n_epochs",        type=int,   default=500)
+    parser.add_argument("--batch_size",      type=int,   default=32)
+    parser.add_argument("--z_dim",           type=int,   default=16)
+    parser.add_argument("--hidden_features", type=int,   default=6)
+    parser.add_argument("--hidden_layers",   type=int,   default=2)
+    parser.add_argument("--spectrum_layer",  type=int,   default=2)
+    parser.add_argument("--use_noise",       type=float, default=0.0)
+    # Per spec: lr_critic=0.00005, lr_generator=0.000025
+    parser.add_argument("--lr_g",            type=float, default=0.000025)
+    parser.add_argument("--lr_d",            type=float, default=0.00005)
+    parser.add_argument("--out_folder",      type=str,   default="./results_crystal_qgan_v2")
+    parser.add_argument("--save_interval",   type=int,   default=10)
+    parser.add_argument("--resume_checkpoint", type=str, default="")
+    parser.add_argument("--lambda_cell",       type=float, default=5.0,
+                        help="Cell MSE loss weight. Set 0 to disable (v4 behaviour).")
+    parser.add_argument("--plateau_window",   type=int,   default=30,
+                        help="Epochs to look back for plateau detection. 0 = disabled.")
+    parser.add_argument("--plateau_tol",      type=float, default=0.02,
+                        help="W-loss range threshold below which plateau is flagged.")
     args = parser.parse_args()
-    
+
     os.makedirs(args.out_folder, exist_ok=True)
     train(args)

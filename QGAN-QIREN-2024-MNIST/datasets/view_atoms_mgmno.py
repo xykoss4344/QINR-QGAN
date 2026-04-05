@@ -33,7 +33,10 @@ def back_to_10_cell(scaled_pos,n_mg,n_mn,n_o):
 
 def back_to_real_cell(scaled_pos, real_cell, n_mg,n_mn,n_o):
     atoms = Atoms('Mg'+str(n_mg)+'Mn'+str(n_mn)+'O'+str(n_o))
-    atoms.set_cell(real_cell)
+    try:
+        atoms.set_cell(real_cell)
+    except Exception as e:
+        raise ValueError(f"Invalid crystal cell parameters (generator not converged yet): {e}")
     atoms.set_scaled_positions(scaled_pos)
     return atoms
 

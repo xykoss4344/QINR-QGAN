@@ -44,10 +44,12 @@ class QuantumLayer(nn.Module):
                 res.append(qml.expval(qml.PauliZ(i)))
             return res
 
-        torch_device = qml.device('default.qubit', wires=in_features)
+        # PL 0.38+ unified default.qubit auto-detects PyTorch/CUDA interface.
+        # backprop vectorises over the full batch — faster than adjoint for small qubit counts.
+        ql_device = qml.device('default.qubit', wires=in_features)
         weight_shape = {"weights1": (self.n_layer, 2, in_features, 3), "weights2": (2, in_features, 3)}
 
-        self.qnode = qml.QNode(_circuit, torch_device, diff_method="backprop", interface="torch")
+        self.qnode = qml.QNode(_circuit, ql_device, diff_method="backprop", interface="torch")
 
         self.qnn = qml.qnn.TorchLayer(self.qnode, weight_shape)
 
@@ -55,13 +57,7 @@ class QuantumLayer(nn.Module):
         orgin_shape = list(x.shape[0:-1]) + [-1]
         if len(orgin_shape) > 2:
             x = x.reshape((-1, self.in_features))
-            
-        # Prevent CUDA context clashes by invoking the quantum simulator explicitly on CPU
-        curr_device = x.device
-        x_cpu = x.to('cpu')
-        out_cpu = self.qnn(x_cpu)
-        out = out_cpu.to(curr_device)
-        
+        out = self.qnn(x)
         return out.reshape(orgin_shape)
 
 class PQWGAN_CC_Crystal():
@@ -85,33 +81,55 @@ class PQWGAN_CC_Crystal():
             return self.fc3(x)
 
     class Hybridren(nn.Module):
+        """
+        Split-head generator:
+          Shared quantum trunk  → 256-dim representation
+          Cell head  (6 values) → 3 lengths (Sigmoid) + 3 angles (Sigmoid)
+          Atom head (84 values) → 28 × 3 fractional positions (Sigmoid)
+          Output: cat([cell, atom]) → 90-dim, matching the (30×3) crystal format.
+
+        Keeping the heads separate ensures WGAN gradients can independently
+        steer cell geometry vs atom positions, preventing cell-param collapse.
+        """
         def __init__(self, in_features, hidden_features, hidden_layers, out_features, spectrum_layer, use_noise, outermost_linear=True):
             super().__init__()
 
-            self.net = []
-            self.net.append(HybridLayer(in_features, hidden_features, spectrum_layer, use_noise, idx=1))
-
+            # ── Shared quantum trunk ──────────────────────────────────────────
+            trunk = [HybridLayer(in_features, hidden_features, spectrum_layer, use_noise, idx=1)]
             for i in range(hidden_layers):
-                self.net.append(HybridLayer(hidden_features, hidden_features, spectrum_layer, use_noise, idx=i + 2))
+                trunk.append(HybridLayer(hidden_features, hidden_features, spectrum_layer, use_noise, idx=i + 2))
+            # Project quantum output to shared representation
+            trunk += [
+                nn.Linear(hidden_features, 128),
+                nn.LeakyReLU(0.2),
+                nn.Linear(128, 256),
+                nn.LeakyReLU(0.2),
+            ]
+            self.trunk = nn.Sequential(*trunk)
 
-            if outermost_linear:
-                # We want final output to be out_features (90)
-                # But here we have an intermediate linear layer
-                final_linear = nn.Linear(hidden_features, 128)
-            else:
-                final_linear = HybridLayer(hidden_features, out_features, spectrum_layer, use_noise)
+            # ── Cell parameter head (6 outputs: 3 lengths + 3 angles) ────────
+            # Both normalised to [0,1]: lengths/30, angles/180
+            self.cell_head = nn.Sequential(
+                nn.Linear(256, 64),
+                nn.LeakyReLU(0.2),
+                nn.Linear(64, 6),
+                nn.Sigmoid(),
+            )
 
-            final_linear_1 = nn.Linear(128, 512)
-            final_linear_2 = nn.Linear(512, 256)
-            final_linear_3 = nn.Linear(256, out_features) # Direct output size
-            self.net.append(final_linear)
-            self.net.append(final_linear_1)
-            self.net.append(final_linear_2)
-            self.net.append(final_linear_3)
-            self.net = nn.Sequential(*self.net)
+            # ── Atom position head (84 outputs: 28 atoms × 3 coords) ─────────
+            # Fractional coordinates in [0,1]
+            self.atom_head = nn.Sequential(
+                nn.Linear(256, 512),
+                nn.LeakyReLU(0.2),
+                nn.Linear(512, 256),
+                nn.LeakyReLU(0.2),
+                nn.Linear(256, 84),
+                nn.Sigmoid(),
+            )
 
         def forward(self, coords):
             coords = coords.clone().detach().requires_grad_(True)
-            output = self.net(coords)
-            # output shape should be (batch, out_features)
-            return output
+            shared = self.trunk(coords)          # (batch, 256)
+            cell   = self.cell_head(shared)      # (batch, 6)
+            atoms  = self.atom_head(shared)      # (batch, 84)
+            return torch.cat([cell, atoms], dim=1)   # (batch, 90)
