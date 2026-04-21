@@ -170,36 +170,56 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
+plt.rcParams.update({
+    'font.size': 12,
+    'font.family': 'serif',
+    'axes.labelsize': 13,
+    'axes.titlesize': 14,
+    'axes.titleweight': 'bold',
+    'axes.labelweight': 'bold',
+    'axes.linewidth': 1.5,
+    'lines.linewidth': 1.5,
+    'legend.fontsize': 10,
+    'legend.frameon': True,
+    'legend.edgecolor': 'black',
+    'legend.facecolor': 'white',
+    'xtick.labelsize': 11,
+    'ytick.labelsize': 11,
+    'xtick.major.width': 1.5,
+    'ytick.major.width': 1.5,
+    'figure.facecolor': 'white',
+    'axes.facecolor': 'white'
+})
+
 valid = [r for r in results if 'error' not in r and r['mace_ehull_meV'] is not None]
 if valid:
     chg_vals  = [r['chgnet_ehull_meV'] for r in valid]
     mace_vals = [r['mace_ehull_meV']   for r in valid]
     labels    = [r['formula']           for r in valid]
 
-    fig, ax = plt.subplots(figsize=(8, 7), facecolor='#0d1117')
-    ax.set_facecolor('#161b22')
+    fig, ax = plt.subplots(figsize=(8, 7))
+    ax.grid(True, linestyle=':', alpha=0.6, color='gray')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
 
-    sc = ax.scatter(chg_vals, mace_vals, c='#f78166', s=120, zorder=5, edgecolors='white', linewidths=0.8)
+    sc = ax.scatter(chg_vals, mace_vals, c='#f78166', s=120, zorder=5, edgecolors='black', linewidths=0.8)
     for x, y, lbl in zip(chg_vals, mace_vals, labels):
         ax.annotate(lbl, (x, y), textcoords='offset points', xytext=(6, 4),
-                    fontsize=7, color='#aaaaaa')
+                    fontsize=8, color='black', alpha=0.7)
 
     # Parity line
     all_v = chg_vals + mace_vals
     lo, hi = min(all_v) - 10, max(all_v) + 10
-    ax.plot([lo, hi], [lo, hi], '--', color='#00e5ff', linewidth=1.5, label='Parity', zorder=3)
-    ax.axhline(100, color='#444c56', linewidth=0.8, linestyle=':')
-    ax.axvline(100, color='#444c56', linewidth=0.8, linestyle=':')
-    ax.fill_between([lo, 100], lo, 100, alpha=0.06, color='#76ff03')
-    ax.text(lo + 5, 95, 'stable\n< 100 meV/at', color='#76ff03', fontsize=7, va='top')
+    ax.plot([lo, hi], [lo, hi], '--', color='blue', linewidth=1.5, label='Parity', zorder=3)
+    ax.axhline(100, color='gray', linewidth=0.8, linestyle=':')
+    ax.axvline(100, color='gray', linewidth=0.8, linestyle=':')
+    ax.fill_between([lo, 100], lo, 100, alpha=0.1, color='green')
+    ax.text(lo + 5, 95, 'stable\n< 100 meV/at', color='green', fontsize=8, va='top')
 
-    ax.set_xlabel('CHGNet  E_above_hull  (meV/at)', color='white', fontsize=11)
-    ax.set_ylabel('MACE-MP-0  E_above_hull  (meV/at)', color='white', fontsize=11)
-    ax.set_title('CHGNet vs MACE-MP-0 Cross-Validation\nTop-10 Quantum v4 Near-Stable Structures',
-                 color='white', fontsize=12, fontweight='bold')
-    ax.tick_params(colors='white')
-    for sp in ax.spines.values(): sp.set_edgecolor('#444c56')
-    ax.legend(labelcolor='white', facecolor='#1a1a2e', edgecolor='#444c56')
+    ax.set_xlabel('CHGNet  E_above_hull  (meV/at)')
+    ax.set_ylabel('MACE-MP-0  E_above_hull  (meV/at)')
+    ax.set_title('CHGNet vs MACE-MP-0 Cross-Validation\nTop-10 Quantum v4 Near-Stable Structures')
+    ax.legend(loc='lower right')
     ax.set_xlim(lo, hi); ax.set_ylim(lo, hi)
 
     plot_path = os.path.join(OUT, 'chgnet_vs_mace_scatter.png')

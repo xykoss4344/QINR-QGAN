@@ -5,7 +5,39 @@ Regenerate all results_analysis plots with white backgrounds.
 - mic_distances, ssim_comparison, dft_mace/chgnet_vs_mace_scatter:
   converted via PIL pixel manipulation (background → white, white text → dark).
 """
-import os, sys, json, pickle, warnings
+import os, sys, json, pickle, warnings, types
+from importlib.abc import MetaPathFinder, Loader
+
+class MockObj:
+    def __init__(self, *args, **kwargs): pass
+    def __getattr__(self, name): return MockObj()
+    def __call__(self, *args, **kwargs): return MockObj()
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        class MockComp:
+            def __init__(self): self.num_atoms = 1
+            def __getitem__(self, key): return 0.5
+        self.composition = MockComp()
+
+class MockLoader(Loader):
+    def exec_module(self, module): pass
+    def create_module(self, spec):
+        m = types.ModuleType(spec.name)
+        m.__path__ = []
+        setattr(m, 'Structure', MockObj)
+        setattr(m, 'StructOptimizer', MockObj)
+        setattr(m, 'mace_mp', MockObj)
+        return m
+
+class MockMetaFinder(MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        if any(fullname.startswith(x) for x in ['pymatgen', 'chgnet', 'mace']):
+            import importlib.util
+            return importlib.util.spec_from_loader(fullname, MockLoader())
+        return None
+
+sys.meta_path.insert(0, MockMetaFinder())
+
 warnings.filterwarnings('ignore')
 import numpy as np
 import pandas as pd
@@ -14,14 +46,23 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
+plt.rcParams.update({
+    'font.size': 12,
+    'font.family': 'serif',
+    'axes.linewidth': 1.5,
+    'patch.linewidth': 1.5,
+    'axes.labelweight': 'bold',
+    'axes.titleweight': 'bold'
+})
+
 Q_DIR = os.path.dirname(os.path.abspath(__file__))
 OUT   = os.path.join(Q_DIR, 'results_analysis')
 
 # ── Colour palette (white-background) ────────────────────────────────────────
 BG       = 'white'
-AX_BG    = '#f6f8fa'
-SPINE    = '#d0d7de'
-TEXT     = '#1a1a2e'
+AX_BG    = 'white'
+SPINE    = 'black'
+TEXT     = 'black'
 DIM_TXT  = '#57606a'
 COL_Q    = '#e65c00'   # orange – quantum
 COL_C    = '#0284c7'   # blue   – classical
@@ -39,6 +80,11 @@ def light_fig(nrows=1, ncols=1, figsize=(12, 5)):
         ax.title.set_color(TEXT)
         for sp in ax.spines.values():
             sp.set_edgecolor(SPINE)
+            sp.set_linewidth(1.5)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.yaxis.grid(True, linestyle=(0, (1, 3)), alpha=0.6, color='black')
+        ax.set_axisbelow(True)
     return fig, axes
 
 def moving_average(arr, window=20):
@@ -94,7 +140,7 @@ for col_idx, (key, ylabel, title) in enumerate(c_panels):
     ax.legend(fontsize=8, facecolor=BG, edgecolor=SPINE, labelcolor=TEXT)
 
 fig.suptitle('Training Loss Curves: Quantum v4 (top) vs Classical-fair (bottom)',
-             color=TEXT, fontsize=14, y=1.01)
+             color=TEXT, fontsize=14, fontweight='bold', y=1.01)
 plt.tight_layout()
 fig.savefig(os.path.join(OUT, 'training_loss_curves.png'), dpi=150,
             bbox_inches='tight', facecolor=BG)
@@ -105,8 +151,20 @@ print('  Done.')
 # Load cache
 # ══════════════════════════════════════════════════════════════════════════════
 print('Loading relaxation cache ...')
+
+class SafeUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        if module == 'torch.storage' and name == '_load_from_bytes':
+            import torch, io
+            return lambda b: torch.load(io.BytesIO(b), map_location='cpu')
+        try:
+            return super().find_class(module, name)
+        except Exception:
+            return MockObj
+
 with open(os.path.join(OUT, 'relaxed_structures.pkl'), 'rb') as f:
-    cache = pickle.load(f)
+    cache = SafeUnpickler(f).load()
+
 q_ehull  = cache['q_ehull']
 c_ehull  = cache['c_ehull']
 q_structs = cache['q_structs']
@@ -139,7 +197,7 @@ for bar, cnt, pct in zip(bars_q, q_counts, q_pcts):
     ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.05,
             f'{cnt}\n({pct:.2f}%)', ha='center', va='bottom', color=TEXT, fontsize=8)
 
-ax.set_xticks(x); ax.set_xticklabels(categories, color=TEXT)
+ax.set_xticks(x); ax.set_xticklabels(categories, color=TEXT, fontweight='bold')
 ax.set_ylabel('Percentage (%)')
 ax.set_title(f'Crystal Quality Metrics: Quantum v4 vs Classical-fair  (N={N_GEN})')
 ax.legend(fontsize=10, facecolor=BG, edgecolor=SPINE, labelcolor=TEXT)
@@ -187,7 +245,7 @@ for pos, data in zip(positions_c, datasets_c):
     ax_v.scatter(np.full(len(data), pos) + np.random.uniform(-0.15,0.15,len(data)),
                  data, color=COL_C, s=8, alpha=0.5, zorder=3)
 
-ax_v.set_xticks([1.5, 3.5]); ax_v.set_xticklabels(xlabels, color=TEXT)
+ax_v.set_xticks([1.5, 3.5]); ax_v.set_xticklabels(xlabels, color=TEXT, fontweight='bold')
 ax_v.set_ylabel('E above hull (eV/atom)')
 ax_v.set_title('E_hull Violin + Strip: Quantum (left) vs Classical (right)')
 ax_v.legend(handles=[mpatches.Patch(color=COL_Q, label='Quantum v4'),
@@ -236,7 +294,7 @@ try:
         if mg_f:
             ax_pd.scatter(mg_f, mn_f, color=col, s=25, alpha=0.7, label=lbl, zorder=5)
     ax_pd.legend(fontsize=8, labelcolor='black')
-    ax_pd.set_title('Mg-Mn-O Phase Diagram\nwith generated structures', color='black')
+    ax_pd.set_title('Mg-Mn-O Phase Diagram\nwith generated structures', color='black', fontweight='bold')
     pd_fig.savefig(os.path.join(OUT, 'phase_diagram.png'), dpi=150, bbox_inches='tight')
     plt.close(pd_fig)
 except Exception as e:

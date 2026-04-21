@@ -4,6 +4,15 @@ import matplotlib.pyplot as plt
 import os
 import argparse
 
+plt.rcParams.update({
+    'font.size': 12, 
+    'font.family': 'serif',
+    'axes.linewidth': 1.5, 
+    'lines.linewidth': 2.0,
+    'axes.labelweight': 'bold',
+    'axes.titleweight': 'bold'
+})
+
 def plot_loss(csv_path="results_crystal_qgan/training_loss_history.csv", save_path="loss_curve.png"):
     if not os.path.exists(csv_path):
         print(f"Error: Could not find {csv_path}")
@@ -20,11 +29,18 @@ def plot_loss(csv_path="results_crystal_qgan/training_loss_history.csv", save_pa
         plt.plot(df['epoch'], df['physics_loss'], label='Physics Penalty', color='green')
         plt.plot(df['epoch'], df['total_g_loss'], label='Total Generator Loss', color='purple')
         
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss Value')
-        plt.title('QINR-QGAN Training Loss Over Epochs')
-        plt.legend()
-        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.xlabel('Epoch', fontweight='bold')
+        plt.ylabel('Loss Value', fontweight='bold')
+        plt.title('QINR-QGAN Training Loss Over Epochs', fontsize=14, fontweight='bold', pad=15)
+        plt.legend(framealpha=1.0, edgecolor='black')
+        plt.grid(True, linestyle=(0, (1, 3)), alpha=0.6, color='black')
+        
+        ax = plt.gca()
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        for spine in ax.spines.values():
+            spine.set_edgecolor('black')
+        ax.tick_params(colors='black', width=1.5)
         
         plt.tight_layout()
         plt.savefig(save_path)

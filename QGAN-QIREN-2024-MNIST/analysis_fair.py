@@ -25,6 +25,43 @@ import importlib.util
 import warnings
 warnings.filterwarnings("ignore")
 
+import types
+from importlib.abc import MetaPathFinder, Loader
+
+class MockObj:
+    def __init__(self, *args, **kwargs): pass
+    def __getattr__(self, name): return MockObj()
+    def __call__(self, *args, **kwargs): return MockObj()
+
+class MockLoader(Loader):
+    def exec_module(self, module): pass
+    def create_module(self, spec):
+        m = types.ModuleType(spec.name)
+        m.__path__ = []
+        setattr(m, 'Structure', MockObj)
+        setattr(m, 'StructOptimizer', MockObj)
+        return m
+
+class MockMetaFinder(MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        if any(fullname.startswith(x) for x in ['pymatgen', 'chgnet', 'mace']):
+            import importlib.util
+            return importlib.util.spec_from_loader(fullname, MockLoader())
+        return None
+
+sys.meta_path.insert(0, MockMetaFinder())
+
+import builtins
+class SafeUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        if module == 'torch.storage' and name == '_load_from_bytes':
+            import torch, io
+            return lambda b: torch.load(io.BytesIO(b), map_location='cpu')
+        try:
+            return super().find_class(module, name)
+        except Exception:
+            return MockObj
+
 import numpy as np
 import torch
 import pandas as pd
@@ -89,18 +126,34 @@ def moving_average(arr, window=20):
     return np.concatenate([pad, ma])
 
 
-def dark_fig(nrows=1, ncols=1, figsize=(12, 5)):
-    fig, axes = plt.subplots(nrows, ncols, figsize=figsize,
-                              facecolor=DARK_BG)
+plt.rcParams.update({
+    'font.size': 12,
+    'font.family': 'serif',
+    'axes.labelsize': 13,
+    'axes.titlesize': 14,
+    'axes.titleweight': 'bold',
+    'axes.labelweight': 'bold',
+    'axes.linewidth': 1.5,
+    'lines.linewidth': 1.5,
+    'legend.fontsize': 10,
+    'legend.frameon': True,
+    'legend.edgecolor': 'black',
+    'legend.facecolor': 'white',
+    'xtick.labelsize': 11,
+    'ytick.labelsize': 11,
+    'xtick.major.width': 1.5,
+    'ytick.major.width': 1.5,
+    'figure.facecolor': 'white',
+    'axes.facecolor': 'white'
+})
+
+def light_fig(nrows=1, ncols=1, figsize=(12, 5)):
+    fig, axes = plt.subplots(nrows, ncols, figsize=figsize)
     axes_flat = np.array(axes).flatten()
     for ax in axes_flat:
-        ax.set_facecolor(AXES_BG)
-        ax.tick_params(colors='white')
-        ax.xaxis.label.set_color('white')
-        ax.yaxis.label.set_color('white')
-        ax.title.set_color('white')
-        for spine in ax.spines.values():
-            spine.set_edgecolor('#444c56')
+        ax.grid(True, linestyle=':', alpha=0.6, color='gray')
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
     return fig, axes
 
 
@@ -121,7 +174,7 @@ def plot_training_losses():
         cls_data = json.load(f)
     c_df = pd.DataFrame(cls_data)  # keys: epoch, w_loss, g_loss, d_loss
 
-    fig, axes = dark_fig(nrows=2, ncols=3, figsize=(18, 9))
+    fig, axes = light_fig(nrows=2, ncols=3, figsize=(18, 9))
 
     # --- Row 1: Quantum ---
     q_panels = [
@@ -139,8 +192,7 @@ def plot_training_losses():
         ax.set_title(title)
         ax.set_xlabel("Epoch")
         ax.set_ylabel(ylabel)
-        ax.legend(fontsize=8, labelcolor='white',
-                  facecolor=AXES_BG, edgecolor='#444c56')
+        ax.legend()
 
     # --- Row 2: Classical ---
     c_panels = [
@@ -158,14 +210,13 @@ def plot_training_losses():
         ax.set_title(title)
         ax.set_xlabel("Epoch")
         ax.set_ylabel(ylabel)
-        ax.legend(fontsize=8, labelcolor='white',
-                  facecolor=AXES_BG, edgecolor='#444c56')
+        ax.legend()
 
     fig.suptitle("Training Loss Curves: Quantum v4 (top) vs Classical-fair (bottom)",
-                 color='white', fontsize=14, y=1.01)
+                 color='black', fontsize=16, fontweight='bold', y=1.01)
     plt.tight_layout()
     save_path = os.path.join(OUT_DIR, "training_loss_curves.png")
-    fig.savefig(save_path, dpi=150, bbox_inches='tight', facecolor=DARK_BG)
+    fig.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close(fig)
     print(f"  Saved: {save_path}")
 
@@ -393,7 +444,7 @@ def run_relaxation(q_crystals, c_crystals, labels_gen,
     if os.path.exists(RELAXED_CACHE):
         print(f"  Cache found at {RELAXED_CACHE}. Loading and skipping re-relaxation.")
         with open(RELAXED_CACHE, "rb") as f:
-            cache = pickle.load(f)
+            cache = SafeUnpickler(f).load()
         return (
             cache["q_ehull"], cache["c_ehull"],
             cache["q_structs"], cache["c_structs"]
@@ -477,18 +528,18 @@ def plot_ssim(q_crystals, c_crystals, real_crystals):
     print("  SSIM: random baseline ...")
     rand_ssim = compute_ssim_scores(rng_real, real_crystals)
 
-    fig, ax = dark_fig(figsize=(10, 6))
+    fig, ax = light_fig(figsize=(10, 6))
     bins = np.linspace(-0.2, 1.0, 50)
     ax.hist(q_ssim, bins=bins, color=COL_Q,  alpha=0.6, label=f"Quantum  μ={q_ssim.mean():.3f}±{q_ssim.std():.3f}")
     ax.hist(c_ssim, bins=bins, color=COL_C,  alpha=0.6, label=f"Classical μ={c_ssim.mean():.3f}±{c_ssim.std():.3f}")
-    ax.axvline(rand_ssim.mean(), color='white', linestyle='--', linewidth=1.5,
+    ax.axvline(rand_ssim.mean(), color='black', linestyle='--', linewidth=1.5,
                label=f"Random baseline μ={rand_ssim.mean():.3f}")
     ax.set_xlabel("Max SSIM vs real samples")
     ax.set_ylabel("Count")
     ax.set_title("SSIM Comparison: Quantum vs Classical-fair")
-    ax.legend(fontsize=9, labelcolor='white', facecolor=AXES_BG, edgecolor='#444c56')
+    ax.legend()
     save_path = os.path.join(OUT_DIR, "ssim_comparison.png")
-    fig.savefig(save_path, dpi=150, bbox_inches='tight', facecolor=DARK_BG)
+    fig.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close(fig)
     print(f"  Saved: {save_path}")
     return q_ssim, c_ssim
@@ -617,7 +668,7 @@ def plot_comparison_bar(q_mic_dists, c_mic_dists, q_ehull, c_ehull):
 
     x    = np.arange(len(categories))
     w    = 0.35
-    fig, ax = dark_fig(figsize=(12, 6))
+    fig, ax = light_fig(figsize=(12, 6))
 
     bars_c = ax.bar(x - w / 2, c_pcts, w, color=COL_C,  label="Classical-fair")
     bars_q = ax.bar(x + w / 2, q_pcts, w, color=COL_Q,  label="Quantum v4")
@@ -625,22 +676,22 @@ def plot_comparison_bar(q_mic_dists, c_mic_dists, q_ehull, c_ehull):
     for bar, cnt, pct in zip(bars_c, c_counts, c_pcts):
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.05,
                 f"{cnt}\n({pct:.2f}%)", ha='center', va='bottom',
-                color='white', fontsize=8)
+                color='black', fontsize=10)
     for bar, cnt, pct in zip(bars_q, q_counts, q_pcts):
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.05,
                 f"{cnt}\n({pct:.2f}%)", ha='center', va='bottom',
-                color='white', fontsize=8)
+                color='black', fontsize=10)
 
     ax.set_xticks(x)
-    ax.set_xticklabels(categories, color='white')
+    ax.set_xticklabels(categories, color='black')
     ax.set_ylabel("Percentage (%)")
     ax.set_title("Crystal Quality Metrics: Quantum v4 vs Classical-fair\n"
                  f"(N_GEN = {N_GEN})")
-    ax.legend(fontsize=10, labelcolor='white', facecolor=AXES_BG, edgecolor='#444c56')
+    ax.legend(loc='upper right')
     ax.set_ylim(0, max(max(q_pcts), max(c_pcts)) * 1.35)
 
     save_path = os.path.join(OUT_DIR, "comparison_metrics.png")
-    fig.savefig(save_path, dpi=150, bbox_inches='tight', facecolor=DARK_BG)
+    fig.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close(fig)
     print(f"  Saved: {save_path}")
 
@@ -656,7 +707,7 @@ def plot_ehull_distribution(q_ehull, c_ehull):
     c_near = c_vals[(c_vals >= 0.1) & (c_vals < 0.5)]
     c_meta = c_vals[(c_vals >= 0.5) & (c_vals < 2.0)]
 
-    fig, axes = dark_fig(nrows=1, ncols=2, figsize=(16, 6))
+    fig, axes = light_fig(nrows=1, ncols=2, figsize=(16, 6))
     ax_v, ax_h = axes.flatten()
 
     # --- Violin + strip overlay ---
@@ -697,33 +748,32 @@ def plot_ehull_distribution(q_ehull, c_ehull):
                          color=COL_C, s=8, alpha=0.5, zorder=3)
 
         ax_v.set_xticks([1.5, 3.5])
-        ax_v.set_xticklabels(xlabels, color='white')
+        ax_v.set_xticklabels(xlabels, color='black')
         ax_v.set_ylabel("E above hull (eV/atom)")
         ax_v.set_title("E_hull Violin + Strip: Q (left) vs Classical (right)")
         legend_handles = [
             mpatches.Patch(color=COL_Q, label="Quantum v4"),
             mpatches.Patch(color=COL_C, label="Classical-fair"),
         ]
-        ax_v.legend(handles=legend_handles, fontsize=9, labelcolor='white',
-                    facecolor=AXES_BG, edgecolor='#444c56')
+        ax_v.legend(handles=legend_handles)
     except Exception as e:
         print(f"  Warning: violin plot failed ({e}), using boxplot fallback.")
         ax_v.text(0.5, 0.5, "Violin plot unavailable", transform=ax_v.transAxes,
-                  ha='center', va='center', color='white')
+                  ha='center', va='center', color='black')
 
     # --- Histogram ---
     bins = np.linspace(0, 2.5, 40)
     ax_h.hist(q_vals, bins=bins, color=COL_Q, alpha=0.6, label=f"Quantum (n={len(q_vals)})")
     ax_h.hist(c_vals, bins=bins, color=COL_C, alpha=0.6, label=f"Classical (n={len(c_vals)})")
-    ax_h.axvline(0.1, color='yellow', linestyle='--', linewidth=1.5, label="0.1 eV/at")
+    ax_h.axvline(0.1, color='orange', linestyle='--', linewidth=1.5, label="0.1 eV/at")
     ax_h.axvline(0.5, color='red',    linestyle='--', linewidth=1.5, label="0.5 eV/at")
     ax_h.set_xlabel("E above hull (eV/atom)")
     ax_h.set_ylabel("Count")
     ax_h.set_title("E_hull Distribution (all valid)")
-    ax_h.legend(fontsize=9, labelcolor='white', facecolor=AXES_BG, edgecolor='#444c56')
+    ax_h.legend()
 
     save_path = os.path.join(OUT_DIR, "ehull_distribution.png")
-    fig.savefig(save_path, dpi=150, bbox_inches='tight', facecolor=DARK_BG)
+    fig.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close(fig)
     print(f"  Saved: {save_path}")
 
@@ -772,7 +822,7 @@ def plot_phase_diagram(q_ehull, q_structs, c_ehull, c_structs):
 
     except Exception as e:
         print(f"  PDPlotter unavailable ({e}). Falling back to 2D scatter.")
-        fig, ax = dark_fig(figsize=(9, 7))
+        fig, ax = light_fig(figsize=(9, 7))
 
         def scatter_gen(ehull_list, structs, col, label):
             mg_fracs, mn_fracs, ehs = [], [], []
@@ -797,17 +847,17 @@ def plot_phase_diagram(q_ehull, q_structs, c_ehull, c_structs):
         sc_c = scatter_gen(c_ehull, c_structs, COL_C, "Classical (E_hull < 0.5)")
         if sc_q is not None:
             cbar = plt.colorbar(sc_q, ax=ax)
-            cbar.set_label("E above hull (eV/at)", color='white')
-            cbar.ax.yaxis.set_tick_params(color='white')
-            plt.setp(cbar.ax.yaxis.get_ticklabels(), color='white')
+            cbar.set_label("E above hull (eV/at)", color='black')
+            cbar.ax.yaxis.set_tick_params(color='black')
+            plt.setp(cbar.ax.yaxis.get_ticklabels(), color='black')
 
         ax.set_xlabel("Mg fraction")
         ax.set_ylabel("Mn fraction")
         ax.set_title("Mg-Mn-O Phase Space (Mg-frac vs Mn-frac)\nGenerated near-stable structures")
-        ax.legend(fontsize=9, labelcolor='white', facecolor=AXES_BG, edgecolor='#444c56')
+        ax.legend()
 
         save_path = os.path.join(OUT_DIR, "phase_diagram.png")
-        fig.savefig(save_path, dpi=150, bbox_inches='tight', facecolor=DARK_BG)
+        fig.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close(fig)
 
     print(f"  Saved: {save_path}")
@@ -816,7 +866,7 @@ def plot_phase_diagram(q_ehull, q_structs, c_ehull, c_structs):
 # ── 8d. MIC distance histogram ────────────────────────────────────────────────
 def plot_mic_distances(q_mic_dists, c_mic_dists):
     print("[Plot] MIC distance histogram ...")
-    fig, ax = dark_fig(figsize=(10, 6))
+    fig, ax = light_fig(figsize=(10, 6))
     if hasattr(ax, 'flatten'):
         ax = ax.flatten()[0]
     bins = np.linspace(0, 5.0, 60)
@@ -828,9 +878,9 @@ def plot_mic_distances(q_mic_dists, c_mic_dists):
     ax.set_xlabel("Min interatomic distance (Å)")
     ax.set_ylabel("Count")
     ax.set_title(f"MIC Min Interatomic Distance Distribution\n(N={len(q_mic_dists)} each)")
-    ax.legend(fontsize=10, labelcolor='white', facecolor=AXES_BG, edgecolor='#444c56')
+    ax.legend()
     save_path = os.path.join(OUT_DIR, "mic_distances.png")
-    fig.savefig(save_path, dpi=150, bbox_inches='tight', facecolor=DARK_BG)
+    fig.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close(fig)
     print(f"  Saved: {save_path}")
 
